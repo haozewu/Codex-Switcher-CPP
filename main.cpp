@@ -136,6 +136,11 @@ static void applyStyle(QApplication& app)
                 stop:0 #d1fae5, stop:1 #a7f3d0);
             color: #065f46;
         }
+        #statusBadge[state="active"] {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                stop:0 #ddd6fe, stop:1 #bfdbfe);
+            color: #3730a3;
+        }
         #statusBadge[state="warning"] {
             background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
                 stop:0 #fef3c7, stop:1 #fde68a);

@@ -37,13 +37,13 @@ protected:
 
 private slots:
     void importAccount();
+    void importCurrentAccount();
     void checkAllQuotas();
     void openSettings();
     void reloadAccounts();
 
     void checkQuota(const QString& accountName);
     void switchAccount(const QString& accountName);
-    void cloudSwitchAccount(const QString& accountName);
     void deleteAccount(const QString& accountName);
 
     void autoQueryCheck();
@@ -55,7 +55,9 @@ private:
     void setupTray();
     void loadState();
     void rebuildCards();
+    void rebuildCardsPreservingScroll();
     void relayoutCards();
+    void refreshCardTimes();
     QJsonObject restoreResult(const QJsonObject& account) const;
 
     QJsonObject accountByName(const QString& name) const;
@@ -63,6 +65,7 @@ private:
     int accountIndex(const QString& name) const;
 
     void sortAccounts();
+    void keepActiveAccountFirst();
     void saveState();
 
     void startUsageQuery(const QString& accountName, const QString& accessToken, const QString& key);
@@ -70,15 +73,24 @@ private:
                               const QString& key, int stage);
 
     void cacheResult(const QJsonObject& account, const QJsonObject& result);
+    void maybeShowQuotaAlert(const QJsonObject& account, const QJsonObject& result);
     double cacheAgeSeconds(const QJsonObject& account) const;
+    void normalizeAutoQuerySchedule();
+    qint64 nextAutoQueryAtMs(const QJsonObject& account) const;
+    void scheduleNextAutoQuery(int minimumDelayMs = 0);
 
     void onRemoteAuthCheckFinished(int exitCode);
     void onRemoteBackupFinished(int exitCode);
-    void onScpUploadFinished(int exitCode);
+    void onScpAuthUploadFinished(int exitCode);
+    void onScpInstallationIdUploadFinished(int exitCode);
     void cleanupCloudTemp();
+    void startCloudSwitch(const QString& accountName);
     void restartLocalCodex();
     void restartRemoteCodex();
     void onRemoteRestartFinished(int exitCode);
+    void finishCloudSwitch(bool ok, const QString& message);
+    void finishLocalRestart(bool ok, const QString& message);
+    void maybeShowSwitchSummary();
 
     AccountCard* findCard(const QString& name) const;
 
@@ -92,8 +104,12 @@ private:
     QJsonArray m_accounts;
     QJsonObject m_cache;
     int m_queryIntervalMinutes;
+    int m_activeQueryIntervalMinutes;
+    int m_quotaAlertThreshold;
+    QString m_activeAccountKey;
     QJsonObject m_remoteConfig;
     QSet<QString> m_queryingKeys;
+    QSet<QString> m_quotaAlertedKeys;
 
     QScrollArea* m_scrollArea;
     QWidget* m_cardContainer;
@@ -107,8 +123,17 @@ private:
     QProcess* m_cloudProcess;
     QString m_cloudAccountName;
     QString m_cloudTmpPath;
-    enum CloudStage { CheckAuth, Backup, Upload, Restart };
+    QString m_cloudInstallationTmpPath;
+    enum CloudStage { CheckAuth, Backup, UploadAuth, UploadInstallationId, Restart };
     CloudStage m_cloudStage;
+    bool m_switchInProgress = false;
+    bool m_waitingLocalRestart = false;
+    bool m_waitingCloudSwitch = false;
+    bool m_localSwitchOk = false;
+    bool m_cloudSwitchOk = false;
+    QString m_switchAccountName;
+    QString m_localSwitchMessage;
+    QString m_cloudSwitchMessage;
 };
 
 #endif // MAINWINDOW_H

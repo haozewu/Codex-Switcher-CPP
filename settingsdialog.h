@@ -17,8 +17,12 @@ class SettingsDialog : public QDialog
     Q_OBJECT
 
 public:
-    explicit SettingsDialog(int intervalMinutes, const QJsonObject& remoteConfig, QWidget* parent = nullptr);
+    explicit SettingsDialog(int intervalMinutes, int activeIntervalMinutes,
+                            int quotaAlertThreshold,
+                            const QJsonObject& remoteConfig, QWidget* parent = nullptr);
     int intervalMinutes() const;
+    int activeIntervalMinutes() const;
+    int quotaAlertThreshold() const;
     QJsonObject remoteConfig() const;
     int resultMinutes() const;
     QJsonObject resultRemote() const;
@@ -29,6 +33,8 @@ private:
     void accept() override;
 
     QSpinBox* m_interval = nullptr;
+    QSpinBox* m_activeInterval = nullptr;
+    QSpinBox* m_quotaAlertThreshold = nullptr;
     QCheckBox* m_enableRemote = nullptr;
     QLineEdit* m_user = nullptr;
     QLineEdit* m_host = nullptr;

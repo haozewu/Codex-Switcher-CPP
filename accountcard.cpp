@@ -10,9 +10,10 @@
 #include <QStyle>
 #include <QVariant>
 #include <QVBoxLayout>
+#include <climits>
 
-AccountCard::AccountCard(const QJsonObject& account, bool remoteEnabled, QWidget* parent)
-    : QFrame(parent), m_account(account)
+AccountCard::AccountCard(const QJsonObject& account, bool remoteEnabled, bool active, QWidget* parent)
+    : QFrame(parent), m_account(account), m_isActive(active)
 {
     m_accountName = account.value("name").toString("未知账号");
     setObjectName("accountCard");
@@ -43,7 +44,7 @@ AccountCard::AccountCard(const QJsonObject& account, bool remoteEnabled, QWidget
     m_planBadge->setObjectName("badge");
     m_statusBadge = new QLabel("未查询");
     m_statusBadge->setObjectName("statusBadge");
-    refreshStatusStyle("idle");
+    applyCurrentStatus();
     header->addWidget(m_planBadge);
     header->addWidget(m_statusBadge);
     root->addLayout(header);
@@ -98,17 +99,11 @@ AccountCard::AccountCard(const QJsonObject& account, bool remoteEnabled, QWidget
     m_queryButton = new QPushButton("↻ 查询");
     m_queryButton->setObjectName("primaryButton");
     connect(m_queryButton, &QPushButton::clicked, this, [this]() { emit queryRequested(m_accountName); });
-    auto* switchButton = new QPushButton("⇄ 本地");
+    auto* switchButton = new QPushButton(remoteEnabled ? "⇄ 切换" : "⇄ 本地");
     switchButton->setObjectName("softButton");
     connect(switchButton, &QPushButton::clicked, this, [this]() { emit switchRequested(m_accountName); });
     actions->addWidget(m_queryButton);
     actions->addWidget(switchButton);
-    if (remoteEnabled) {
-        auto* cloudButton = new QPushButton("☁ 云端");
-        cloudButton->setObjectName("softButton");
-        connect(cloudButton, &QPushButton::clicked, this, [this]() { emit cloudSwitchRequested(m_accountName); });
-        actions->addWidget(cloudButton);
-    }
     auto* deleteButton = new QPushButton("× 删除");
     deleteButton->setObjectName("dangerButton");
     connect(deleteButton, &QPushButton::clicked, this, [this]() { emit deleteRequested(m_accountName); });
@@ -119,12 +114,24 @@ AccountCard::AccountCard(const QJsonObject& account, bool remoteEnabled, QWidget
 QString AccountCard::accountName() const { return m_accountName; }
 QJsonObject AccountCard::account() const { return m_account; }
 
+void AccountCard::setActive(bool active)
+{
+    if (m_isActive == active)
+        return;
+    m_isActive = active;
+    applyCurrentStatus();
+}
+
 void AccountCard::setLoading(bool loading)
 {
     m_queryButton->setEnabled(!loading);
     m_queryButton->setText(loading ? "查询中..." : "↻ 查询");
-    m_statusBadge->setText(loading ? "查询中" : "未查询");
-    refreshStatusStyle(loading ? "loading" : "idle");
+    if (loading) {
+        m_statusBadge->setText("查询中");
+        refreshStatusStyle("loading");
+    } else {
+        applyCurrentStatus();
+    }
 }
 
 void AccountCard::setResult(const QJsonObject& result)
@@ -133,14 +140,24 @@ void AccountCard::setResult(const QJsonObject& result)
     m_queryButton->setText("↻ 查询");
 
     if (!result.value("ok").toBool()) {
-        m_statusBadge->setText("失败");
-        refreshStatusStyle("error");
+        m_lastResult = result;
+        const QJsonObject info = result.value("info").toObject();
+        if (!info.isEmpty()) {
+            const QString plan = info.value("plan").toString();
+            if (!plan.isEmpty())
+                m_planBadge->setText(plan.toUpper());
+            setLimit(m_primaryBar, m_primaryPercent, m_primaryMeta, info.value("primary").toObject());
+            setLimit(m_secondaryBar, m_secondaryPercent, m_secondaryMeta, info.value("secondary").toObject());
+        }
+
+        applyCurrentStatus();
         const QString queriedAt = result.value("queried_at_str").toString();
-        const QString prefix = queriedAt.isEmpty() ? QString() : QString("查询: %1\n").arg(queriedAt);
-        m_message->setText(prefix + result.value("message").toString("查询失败"));
+        const QString prefix = queriedAt.isEmpty() ? QString("查询: 失败") : QString("查询: %1").arg(queriedAt);
+        m_message->setText(prefix + "\n" + result.value("message").toString("查询失败"));
         return;
     }
 
+    m_lastResult = result;
     const QJsonObject info = result.value("info").toObject();
     const QString plan = info.value("plan").toString();
     if (!plan.isEmpty())
@@ -152,8 +169,8 @@ void AccountCard::setResult(const QJsonObject& result)
     const double primary = info.value("primary").toObject().value("remaining_pct").toDouble(-1);
     const bool allowed = info.value("rate_limit_allowed").toBool(true);
     const QString state = (!allowed || (primary >= 0 && primary <= 11)) ? "error" : ((primary >= 0 && primary <= 35) ? "warning" : "ok");
-    m_statusBadge->setText(state == "ok" ? "可用" : (state == "warning" ? "偏低" : "受限"));
-    refreshStatusStyle(state);
+    m_lastResult["status_state"] = state;
+    applyCurrentStatus();
     const QString queriedAt = result.value("queried_at_str").toString();
     const QString message = result.value("message").toString();
     m_message->setText(queriedAt.isEmpty()
@@ -173,12 +190,66 @@ void AccountCard::setLimit(QProgressBar* bar, QLabel* percent, QLabel* meta, con
         percent->setText(QString("剩余 %1%").arg(qRound(remaining)));
         bar->setValue(qBound(0, qRound(remaining), 100));
         bar->setProperty("level", QVariant(levelForRemaining(remaining)));
-        const int resetAfter = limit.value("reset_after_seconds").toInt(-1);
-        const double resetAt = limit.value("reset_at_dt").toDouble(0);
-        meta->setText(QString("重置 %1\n剩余 %2").arg(formatReset(resetAt), formatSeconds(resetAfter)));
+        refreshLimitTime(meta, limit);
     }
     bar->style()->unpolish(bar);
     bar->style()->polish(bar);
+}
+
+void AccountCard::refreshRelativeTimes()
+{
+    if (m_lastResult.value("info").toObject().isEmpty())
+        return;
+
+    const QJsonObject info = m_lastResult.value("info").toObject();
+    refreshLimitTime(m_primaryMeta, info.value("primary").toObject());
+    refreshLimitTime(m_secondaryMeta, info.value("secondary").toObject());
+}
+
+void AccountCard::refreshLimitTime(QLabel* meta, const QJsonObject& limit)
+{
+    if (!meta)
+        return;
+
+    const double remaining = limit.value("remaining_pct").toDouble(-1);
+    if (remaining < 0) {
+        meta->setText("暂无窗口数据");
+        return;
+    }
+
+    const double resetAt = limit.value("reset_at_dt").toDouble(0);
+    int seconds = limit.value("reset_after_seconds").toInt(-1);
+    if (resetAt > 0) {
+        const qint64 now = QDateTime::currentDateTimeUtc().toSecsSinceEpoch();
+        const qint64 remainingSeconds = qMax<qint64>(0, static_cast<qint64>(resetAt) - now);
+        seconds = remainingSeconds > INT_MAX ? INT_MAX : static_cast<int>(remainingSeconds);
+    }
+    meta->setText(QString("重置 %1\n剩余 %2").arg(formatReset(resetAt), formatSeconds(seconds)));
+}
+
+void AccountCard::applyCurrentStatus()
+{
+    if (m_isActive) {
+        m_statusBadge->setText("使用中");
+        refreshStatusStyle("active");
+        return;
+    }
+
+    if (m_lastResult.isEmpty()) {
+        m_statusBadge->setText("未查询");
+        refreshStatusStyle("idle");
+        return;
+    }
+
+    if (!m_lastResult.value("ok").toBool()) {
+        m_statusBadge->setText("失败");
+        refreshStatusStyle("error");
+        return;
+    }
+
+    const QString state = m_lastResult.value("status_state").toString("ok");
+    m_statusBadge->setText(state == "ok" ? "可用" : (state == "warning" ? "偏低" : "受限"));
+    refreshStatusStyle(state);
 }
 
 QString AccountCard::levelForRemaining(double remaining)

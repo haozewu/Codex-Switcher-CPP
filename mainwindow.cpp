@@ -8,6 +8,7 @@
 #include <QHBoxLayout>
 #include <QGridLayout>
 #include <QScrollArea>
+#include <QScrollBar>
 #include <QPushButton>
 #include <QLabel>
 #include <QMessageBox>
@@ -33,40 +34,60 @@
 #include <QSizePolicy>
 #include <QColor>
 #include <QPixmap>
+#include <QRandomGenerator>
+#include <cmath>
 
+static double queryJitterSeconds()
+{
+    return static_cast<double>(QRandomGenerator::global()->bounded(1, 9));
+}
+
+static double stableJitterSeconds(const QString& key)
+{
+    return 1.0 + static_cast<double>(qHash(key) % 8);
+}
+
+static double stableOffsetSeconds(const QString& key, double intervalSeconds)
+{
+    if (intervalSeconds <= 1.0)
+        return stableJitterSeconds(key);
+    return 1.0 + static_cast<double>(qHash(key) % qMax(1, static_cast<int>(intervalSeconds - 1.0)));
+}
+
+static QString remoteCodexFileTarget(const QString& user, const QString& host, const QString& fileName)
+{
+    return user + "@" + host + ":.codex/" + fileName;
+}
+
+#ifdef Q_OS_WIN
+static QString windowsRestartCodexScript()
+{
+    return QString::fromUtf8(
+        "$ErrorActionPreference = 'Stop'; "
+        "$app = Get-StartApps | Where-Object { $_.Name -eq 'Codex' -or $_.AppID -like 'OpenAI.Codex_*' } | Select-Object -First 1; "
+        "if (-not $app) { throw '未找到 Codex 开始菜单入口'; } "
+        "$targets = Get-Process Codex,codex -ErrorAction SilentlyContinue | Where-Object { "
+        "  $_.Path -and ("
+        "    $_.Path -like '*\\WindowsApps\\OpenAI.Codex_*\\app\\*' -or "
+        "    $_.Path -like '*\\AppData\\Local\\OpenAI\\Codex\\bin\\*'"
+        "  )"
+        "}; "
+        "if ($targets) { $targets | Stop-Process -Force; Start-Sleep -Milliseconds 800; } "
+        "Start-Process ('shell:AppsFolder\\' + $app.AppID);"
+    );
+}
+#else
 static QString findCodexExecutable()
 {
-    const QStringList executableNames = {"codex.exe", "codex.cmd", "codex"};
+    const QStringList executableNames = {"codex", "codex.exe", "codex.cmd"};
     for (const QString& name : executableNames) {
         const QString found = QStandardPaths::findExecutable(name);
         if (!found.isEmpty())
             return found;
     }
-
-    const QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-    const QString localAppData = env.value("LOCALAPPDATA");
-    const QStringList aliasPaths = {
-        localAppData + "/Microsoft/WindowsApps/codex.exe",
-        localAppData + "/Microsoft/WindowsApps/codex.cmd",
-        env.value("APPDATA") + "/npm/codex.cmd",
-        env.value("USERPROFILE") + "/AppData/Roaming/npm/codex.cmd"
-    };
-    for (const QString& path : aliasPaths) {
-        if (!path.startsWith("/") && QFileInfo::exists(path))
-            return QDir::toNativeSeparators(path);
-    }
-
-    const QString programFiles = env.value("ProgramFiles", "C:/Program Files");
-    QDir windowsApps(programFiles + "/WindowsApps");
-    const QStringList packages = windowsApps.entryList({"OpenAI.Codex_*"}, QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
-    for (int i = packages.size() - 1; i >= 0; --i) {
-        const QString path = windowsApps.absoluteFilePath(packages.at(i) + "/app/resources/codex.exe");
-        if (QFileInfo::exists(path))
-            return QDir::toNativeSeparators(path);
-    }
-
     return QString();
 }
+#endif
 
 MainWindow::MainWindow(QWidget* parent)
     : QWidget(parent)
@@ -76,6 +97,8 @@ MainWindow::MainWindow(QWidget* parent)
     , m_trayAvailable(false)
     , m_quitFromTray(false)
     , m_queryIntervalMinutes(10)
+    , m_activeQueryIntervalMinutes(1)
+    , m_quotaAlertThreshold(10)
     , m_cardColumns(2)
     , m_cloudProcess(nullptr)
     , m_cloudStage(CheckAuth)
@@ -92,8 +115,9 @@ MainWindow::MainWindow(QWidget* parent)
     rebuildCards();
 
     m_autoQueryTimer = new QTimer(this);
+    m_autoQueryTimer->setSingleShot(true);
     connect(m_autoQueryTimer, &QTimer::timeout, this, &MainWindow::autoQueryCheck);
-    m_autoQueryTimer->start(30000);
+    scheduleNextAutoQuery(30000);
 }
 
 MainWindow::~MainWindow()
@@ -139,6 +163,11 @@ void MainWindow::setupUI()
     importBtn->setCursor(Qt::PointingHandCursor);
     connect(importBtn, &QPushButton::clicked, this, &MainWindow::importAccount);
 
+    QPushButton* importCurrentBtn = new QPushButton(QString::fromUtf8("+ 当前配置"));
+    importCurrentBtn->setObjectName("softButton");
+    importCurrentBtn->setCursor(Qt::PointingHandCursor);
+    connect(importCurrentBtn, &QPushButton::clicked, this, &MainWindow::importCurrentAccount);
+
     QPushButton* queryAllBtn = new QPushButton(QString::fromUtf8("\u21bb 全部查询"));
     queryAllBtn->setObjectName("softButton");
     queryAllBtn->setCursor(Qt::PointingHandCursor);
@@ -155,6 +184,7 @@ void MainWindow::setupUI()
     connect(refreshBtn, &QPushButton::clicked, this, &MainWindow::reloadAccounts);
 
     toolbar->addWidget(importBtn);
+    toolbar->addWidget(importCurrentBtn);
     toolbar->addWidget(queryAllBtn);
     toolbar->addWidget(settingsBtn);
     toolbar->addWidget(refreshBtn);
@@ -217,25 +247,45 @@ void MainWindow::setupTray()
 void MainWindow::loadState()
 {
     m_accounts = m_dm->loadAccounts();
+    QString installationError;
+    if (m_dm->ensureAccountInstallationIds(m_accounts, installationError)) {
+        if (!m_dm->saveAccounts(m_accounts)) {
+            QMessageBox::warning(this, QString::fromUtf8("账号保存失败"),
+                QString::fromUtf8("installation_id 已生成，但 accounts.json 保存失败。"));
+        }
+    } else {
+        QMessageBox::warning(this, QString::fromUtf8("installation_id 初始化失败"), installationError);
+    }
     m_cache = m_dm->loadCache();
 
     QJsonObject settings = m_dm->loadSettings();
     m_queryIntervalMinutes = settings.value("interval_minutes").toInt(10);
     if (m_queryIntervalMinutes < 1) m_queryIntervalMinutes = 10;
+    m_activeQueryIntervalMinutes = settings.value("active_interval_minutes").toInt(1);
+    if (m_activeQueryIntervalMinutes < 1) m_activeQueryIntervalMinutes = 1;
+    m_quotaAlertThreshold = settings.value("quota_alert_threshold").toInt(10);
+    m_quotaAlertThreshold = qBound(0, m_quotaAlertThreshold, 100);
+    m_activeAccountKey = settings.value("active_account_key").toString();
 
     m_remoteConfig = settings.value("remote_config").toObject();
     if (m_remoteConfig.isEmpty()) {
         m_remoteConfig["enabled"] = false;
-        m_remoteConfig["user"] = "haoze";
+        m_remoteConfig["user"] = "root";
         m_remoteConfig["host"] = "127.0.0.1";
-        m_remoteConfig["port"] = 9002;
+        m_remoteConfig["port"] = 22;
     }
+
+    normalizeAutoQuerySchedule();
+    keepActiveAccountFirst();
 }
 
 void MainWindow::saveState()
 {
     QJsonObject settings;
     settings["interval_minutes"] = m_queryIntervalMinutes;
+    settings["active_interval_minutes"] = m_activeQueryIntervalMinutes;
+    settings["quota_alert_threshold"] = m_quotaAlertThreshold;
+    settings["active_account_key"] = m_activeAccountKey;
     settings["remote_config"] = m_remoteConfig;
     m_dm->saveSettings(settings);
 }
@@ -271,16 +321,21 @@ void MainWindow::rebuildCards()
             QString name = acc.value("name").toString();
             QString key = DataManager::accountKey(acc);
 
-            AccountCard* card = new AccountCard(acc, remoteEnabled, m_cardContainer);
+            const bool active = key == m_activeAccountKey;
+            AccountCard* card = new AccountCard(acc, remoteEnabled, active, m_cardContainer);
             connect(card, &AccountCard::queryRequested, this, &MainWindow::checkQuota);
             connect(card, &AccountCard::switchRequested, this, &MainWindow::switchAccount);
-            connect(card, &AccountCard::cloudSwitchRequested, this, &MainWindow::cloudSwitchAccount);
             connect(card, &AccountCard::deleteRequested, this, &MainWindow::deleteAccount);
 
             if (m_queryingKeys.contains(key)) {
                 card->setLoading(true);
             } else if (m_cache.contains(key)) {
-                card->setResult(restoreResult(acc));
+                const QJsonObject cacheEntry = m_cache.value(key).toObject();
+                if (cacheEntry.contains("queried_at_ts") ||
+                    cacheEntry.contains("message") ||
+                    cacheEntry.contains("info")) {
+                    card->setResult(restoreResult(acc));
+                }
             }
             m_cards.append(card);
         }
@@ -290,6 +345,23 @@ void MainWindow::rebuildCards()
 
     m_countBadge->setText(QString::fromUtf8("%1 个账号").arg(m_accounts.size()));
     m_fileLabel->setText(m_dm->accountsFilePath());
+}
+
+void MainWindow::rebuildCardsPreservingScroll()
+{
+    QScrollBar* bar = m_scrollArea ? m_scrollArea->verticalScrollBar() : nullptr;
+    const int scrollValue = bar ? bar->value() : 0;
+
+    rebuildCards();
+
+    if (!bar)
+        return;
+
+    auto restoreScroll = [bar, scrollValue]() {
+        bar->setValue(qBound(bar->minimum(), scrollValue, bar->maximum()));
+    };
+    restoreScroll();
+    QTimer::singleShot(0, this, restoreScroll);
 }
 
 void MainWindow::relayoutCards()
@@ -436,26 +508,72 @@ void MainWindow::importAccount()
         return;
 
     QJsonArray newAccounts = dlg.accounts();
+    QString installationError;
+    if (!m_dm->ensureAccountInstallationIds(newAccounts, installationError)) {
+        QMessageBox::critical(this, QString::fromUtf8("导入失败"),
+            QString::fromUtf8("生成账号 installation_id 失败:\n%1").arg(installationError));
+        return;
+    }
+
     QSet<QString> existing;
     for (int i = 0; i < m_accounts.size(); ++i) {
         existing.insert(m_accounts[i].toObject().value("name").toString());
     }
 
+    QStringList addedNames;
     for (int i = 0; i < newAccounts.size(); ++i) {
         QJsonObject acc = newAccounts[i].toObject();
-        if (!existing.contains(acc.value("name").toString())) {
+        const QString name = acc.value("name").toString();
+        if (!existing.contains(name)) {
             m_accounts.append(acc);
-            existing.insert(acc.value("name").toString());
+            existing.insert(name);
+            addedNames.append(name);
         }
     }
 
-    m_dm->saveAccounts(m_accounts);
+    if (!m_dm->saveAccounts(m_accounts)) {
+        QMessageBox::warning(this, QString::fromUtf8("账号保存失败"),
+            QString::fromUtf8("导入账号已处理，但 accounts.json 保存失败。"));
+    }
     sortAccounts();
     rebuildCards();
 
-    for (int i = 0; i < newAccounts.size(); ++i) {
-        checkQuota(newAccounts[i].toObject().value("name").toString());
+    for (const QString& name : addedNames)
+        checkQuota(name);
+}
+
+void MainWindow::importCurrentAccount()
+{
+    QJsonObject account;
+    QString errorMsg;
+    if (!m_dm->importCurrentAuthAccount(account, errorMsg)) {
+        QMessageBox::critical(this, QString::fromUtf8("导入当前配置失败"), errorMsg);
+        return;
     }
+
+    const QString name = account.value("name").toString();
+    const QString key = DataManager::accountKey(account);
+    for (int i = 0; i < m_accounts.size(); ++i) {
+        QJsonObject existing = m_accounts.at(i).toObject();
+        if (existing.value("name").toString() == name || DataManager::accountKey(existing) == key) {
+            QString cleanupError;
+            m_dm->removeAccountData(account, cleanupError);
+            QMessageBox::information(this, QString::fromUtf8("已存在"),
+                QString::fromUtf8("当前配置已经在账号列表中。"));
+            return;
+        }
+    }
+
+    m_accounts.append(account);
+    if (!m_dm->saveAccounts(m_accounts)) {
+        QMessageBox::warning(this, QString::fromUtf8("账号保存失败"),
+            QString::fromUtf8("当前配置已复制到 data，但 accounts.json 保存失败。"));
+        return;
+    }
+
+    sortAccounts();
+    rebuildCards();
+    checkQuota(name);
 }
 
 void MainWindow::checkAllQuotas()
@@ -467,21 +585,52 @@ void MainWindow::checkAllQuotas()
 
 void MainWindow::openSettings()
 {
-    SettingsDialog dlg(m_queryIntervalMinutes, m_remoteConfig, this);
+    SettingsDialog dlg(m_queryIntervalMinutes, m_activeQueryIntervalMinutes,
+                       m_quotaAlertThreshold, m_remoteConfig, this);
     if (dlg.exec() == QDialog::Accepted) {
         m_queryIntervalMinutes = dlg.intervalMinutes();
+        m_activeQueryIntervalMinutes = dlg.activeIntervalMinutes();
+        const int oldQuotaAlertThreshold = m_quotaAlertThreshold;
+        m_quotaAlertThreshold = dlg.quotaAlertThreshold();
+        if (m_quotaAlertThreshold != oldQuotaAlertThreshold)
+            m_quotaAlertedKeys.clear();
         m_remoteConfig = dlg.remoteConfig();
+        if (!m_activeAccountKey.isEmpty()) {
+            QJsonObject entry = m_cache.value(m_activeAccountKey).toObject();
+            const double queriedAt = entry.value("queried_at_ts").toDouble(-1);
+            const bool disabled = entry.value("auto_query_disabled").toBool(false) ||
+                entry.value("http_status").toInt(-1) == 401 ||
+                entry.value("message").toString().contains("HTTP 401");
+            if (queriedAt >= 0 && !disabled) {
+                entry["next_auto_query_ts"] = queriedAt + (m_activeQueryIntervalMinutes * 60.0) + queryJitterSeconds();
+                m_cache[m_activeAccountKey] = entry;
+                m_dm->saveCache(m_cache);
+            }
+        }
         saveState();
+        normalizeAutoQuerySchedule();
         rebuildCards();
+        scheduleNextAutoQuery();
     }
 }
 
 void MainWindow::reloadAccounts()
 {
     m_accounts = m_dm->loadAccounts();
+    QString installationError;
+    if (m_dm->ensureAccountInstallationIds(m_accounts, installationError)) {
+        if (!m_dm->saveAccounts(m_accounts)) {
+            QMessageBox::warning(this, QString::fromUtf8("账号保存失败"),
+                QString::fromUtf8("installation_id 已生成，但 accounts.json 保存失败。"));
+        }
+    } else {
+        QMessageBox::warning(this, QString::fromUtf8("installation_id 初始化失败"), installationError);
+    }
     m_cache = m_dm->loadCache();
+    normalizeAutoQuerySchedule();
     sortAccounts();
     rebuildCards();
+    scheduleNextAutoQuery();
 }
 
 void MainWindow::checkQuota(const QString& accountName)
@@ -568,7 +717,7 @@ void MainWindow::onUsageReplyFinished(QNetworkReply* reply, const QString& name,
                 if (card) card->setResult(result);
 
                 sortAccounts();
-                rebuildCards();
+                rebuildCardsPreservingScroll();
                 return;
             }
         }
@@ -628,7 +777,7 @@ void MainWindow::onUsageReplyFinished(QNetworkReply* reply, const QString& name,
                 if (card) card->setResult(result);
 
                 sortAccounts();
-                rebuildCards();
+                rebuildCardsPreservingScroll();
                 return;
             }
         }
@@ -663,40 +812,115 @@ void MainWindow::onUsageReplyFinished(QNetworkReply* reply, const QString& name,
     } else {
         result["ok"] = false;
         result["account"] = name;
+        result["http_status"] = statusCode;
         QString reason = reply->errorString();
         if (reason.isEmpty())
             reason = QString::fromUtf8("HTTP %1").arg(statusCode);
-        result["message"] = QString::fromUtf8("查询失败: %1 (HTTP %2)。如果是 SSL 错误，请确认 exe 同目录存在 libssl/libcrypto。")
-                                .arg(reason, QString::number(statusCode));
+        QString message = QString::fromUtf8("查询失败: %1 (HTTP %2)。如果是 SSL 错误，请确认 exe 同目录存在 libssl/libcrypto。")
+                              .arg(reason, QString::number(statusCode));
+        if (statusCode == 401)
+            message += QString::fromUtf8("\n已停止该账号的后台自动查询；手动查询仍可使用。");
+        result["message"] = message;
     }
     result["queried_at_str"] = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
 
-    QJsonObject account = accountByKey(key);
-    if (!account.isEmpty()) cacheResult(account, result);
     m_queryingKeys.remove(key);
 
     AccountCard* card = findCard(name);
     if (card) card->setResult(result);
 
-    sortAccounts();
-    rebuildCards();
+    QJsonObject account = accountByKey(key);
+    if (!account.isEmpty()) {
+        cacheResult(account, result);
+        sortAccounts();
+        rebuildCardsPreservingScroll();
+    } else {
+        scheduleNextAutoQuery(30000);
+    }
 }
 
 void MainWindow::cacheResult(const QJsonObject& account, const QJsonObject& result)
 {
     QString key = DataManager::accountKey(account);
+    const QJsonObject previous = m_cache.value(key).toObject();
     QJsonObject entry;
-    entry["queried_at_ts"] = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch() / 1000.0;
+    const double queriedAtTs = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch() / 1000.0;
+    const int intervalMinutes = (key == m_activeAccountKey)
+        ? m_activeQueryIntervalMinutes
+        : m_queryIntervalMinutes;
+    const bool isUnauthorized = !result.value("ok").toBool() &&
+        result.value("http_status").toInt(-1) == 401;
+    entry["queried_at_ts"] = queriedAtTs;
+    if (isUnauthorized) {
+        entry["auto_query_disabled"] = true;
+        entry["next_auto_query_ts"] = QJsonValue::Null;
+    } else {
+        entry["auto_query_disabled"] = false;
+        entry["next_auto_query_ts"] = queriedAtTs + (intervalMinutes * 60.0) + queryJitterSeconds();
+    }
     entry["queried_at_str"] = result.value("queried_at_str").toString(
         QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss"));
     entry["ok"] = result.value("ok");
+    entry["http_status"] = result.value("http_status");
     entry["message"] = result.value("message");
     entry["fallback"] = result.value("fallback");
     entry["fallback_title"] = result.value("fallback_title");
-    entry["info"] = result.value("info");
+    QJsonValue info = result.value("info");
+    if (!result.value("ok").toBool() && (!info.isObject() || info.toObject().isEmpty()))
+        info = previous.value("info");
+    entry["info"] = info;
 
     m_cache[key] = entry;
     m_dm->saveCache(m_cache);
+    maybeShowQuotaAlert(account, result);
+    scheduleNextAutoQuery();
+}
+
+void MainWindow::maybeShowQuotaAlert(const QJsonObject& account, const QJsonObject& result)
+{
+    if (m_quotaAlertThreshold <= 0 || !result.value("ok").toBool())
+        return;
+
+    const QJsonObject info = result.value("info").toObject();
+    if (info.isEmpty())
+        return;
+
+    const QString accountKey = DataManager::accountKey(account);
+    const QString accountName = account.value("name").toString(result.value("account").toString());
+    QStringList lines;
+    QStringList newlyAlerted;
+
+    auto checkWindow = [&](const QString& id, const QString& label, const QJsonObject& limit) {
+        const double remaining = limit.value("remaining_pct").toDouble(-1);
+        const QString alertKey = accountKey + ":" + id;
+        if (remaining < 0)
+            return;
+
+        if (remaining <= m_quotaAlertThreshold) {
+            if (!m_quotaAlertedKeys.contains(alertKey)) {
+                lines << QString::fromUtf8("%1 仅剩 %2%，已低于提醒阈值 %3%。")
+                    .arg(label)
+                    .arg(QString::number(remaining, 'f', 1))
+                    .arg(m_quotaAlertThreshold);
+                newlyAlerted << alertKey;
+            }
+        } else {
+            m_quotaAlertedKeys.remove(alertKey);
+        }
+    };
+
+    checkWindow("primary", QString::fromUtf8("5h 限额"), info.value("primary").toObject());
+    checkWindow("secondary", QString::fromUtf8("周限额"), info.value("secondary").toObject());
+
+    if (lines.isEmpty())
+        return;
+
+    for (const QString& key : newlyAlerted)
+        m_quotaAlertedKeys.insert(key);
+
+    QMessageBox::warning(this,
+        QString::fromUtf8("配额接近临界"),
+        QString::fromUtf8("账号：%1\n\n%2").arg(accountName, lines.join("\n")));
 }
 
 double MainWindow::cacheAgeSeconds(const QJsonObject& account) const
@@ -712,6 +936,114 @@ double MainWindow::cacheAgeSeconds(const QJsonObject& account) const
     return now - ts;
 }
 
+void MainWindow::normalizeAutoQuerySchedule()
+{
+    const double now = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch() / 1000.0;
+    bool changed = false;
+
+    for (int i = 0; i < m_accounts.size(); ++i) {
+        const QJsonObject account = m_accounts.at(i).toObject();
+        const QString key = DataManager::accountKey(account);
+        if (key.isEmpty())
+            continue;
+
+        QJsonObject entry = m_cache.value(key).toObject();
+        const bool disabled = entry.value("auto_query_disabled").toBool(false) ||
+            entry.value("http_status").toInt(-1) == 401 ||
+            entry.value("message").toString().contains("HTTP 401");
+        if (disabled)
+            continue;
+
+        const int intervalMinutes = (key == m_activeAccountKey)
+            ? m_activeQueryIntervalMinutes
+            : m_queryIntervalMinutes;
+        const double intervalSeconds = qMax(1, intervalMinutes) * 60.0;
+        const QJsonValue nextValue = entry.value("next_auto_query_ts");
+        double nextTs = nextValue.isDouble() ? nextValue.toDouble(-1) : -1;
+
+        if (nextTs < 0) {
+            const double queriedAt = entry.value("queried_at_ts").toDouble(-1);
+            if (queriedAt >= 0) {
+                nextTs = queriedAt + intervalSeconds + stableJitterSeconds(key);
+            } else {
+                nextTs = now + stableOffsetSeconds(key, intervalSeconds);
+            }
+        }
+
+        if (nextTs <= now) {
+            const double missedIntervals = std::floor((now - nextTs) / intervalSeconds) + 1.0;
+            nextTs += missedIntervals * intervalSeconds;
+        }
+
+        if (!nextValue.isDouble() || qAbs(nextValue.toDouble(-1) - nextTs) > 0.001) {
+            entry["next_auto_query_ts"] = nextTs;
+            entry["auto_query_disabled"] = false;
+            m_cache[key] = entry;
+            changed = true;
+        }
+    }
+
+    if (changed)
+        m_dm->saveCache(m_cache);
+}
+
+qint64 MainWindow::nextAutoQueryAtMs(const QJsonObject& account) const
+{
+    const QString key = DataManager::accountKey(account);
+    const QJsonObject entry = m_cache.value(key).toObject();
+    if (entry.isEmpty())
+        return -1;
+    if (entry.value("auto_query_disabled").toBool(false) ||
+        entry.value("http_status").toInt(-1) == 401 ||
+        entry.value("message").toString().contains("HTTP 401")) {
+        return -1;
+    }
+
+    const int intervalMinutes = (key == m_activeAccountKey)
+        ? m_activeQueryIntervalMinutes
+        : m_queryIntervalMinutes;
+    const double intervalSeconds = qMax(1, intervalMinutes) * 60.0;
+    const QJsonValue nextValue = entry.value("next_auto_query_ts");
+    double nextTs = nextValue.isDouble() ? nextValue.toDouble(-1) : -1;
+    if (nextTs < 0) {
+        const double queriedAt = entry.value("queried_at_ts").toDouble(-1);
+        if (queriedAt < 0)
+            return -1;
+        nextTs = queriedAt + intervalSeconds + stableJitterSeconds(key);
+    }
+    return static_cast<qint64>(nextTs * 1000.0);
+}
+
+void MainWindow::scheduleNextAutoQuery(int minimumDelayMs)
+{
+    if (!m_autoQueryTimer)
+        return;
+
+    const qint64 nowMs = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch();
+    qint64 nextMs = -1;
+    for (int i = 0; i < m_accounts.size(); ++i) {
+        const qint64 due = nextAutoQueryAtMs(m_accounts.at(i).toObject());
+        if (due < 0)
+            continue;
+        if (nextMs < 0 || due < nextMs)
+            nextMs = due;
+    }
+
+    int delayMs = 30000;
+    if (nextMs >= 0) {
+        const qint64 untilDue = qMax<qint64>(0, nextMs - nowMs);
+        delayMs = static_cast<int>(qMin<qint64>(30000, untilDue));
+    }
+    delayMs = qMax(delayMs, minimumDelayMs);
+    m_autoQueryTimer->start(delayMs);
+}
+
+void MainWindow::refreshCardTimes()
+{
+    for (AccountCard* card : m_cards)
+        card->refreshRelativeTimes();
+}
+
 void MainWindow::sortAccounts()
 {
     QList<QJsonObject> accounts;
@@ -719,80 +1051,201 @@ void MainWindow::sortAccounts()
         accounts.append(m_accounts.at(i).toObject());
 
     auto sortKey = [this](const QJsonObject& oa, const QJsonObject& ob) -> bool {
-        QString na = oa.value("name").toString();
-        QString nb = ob.value("name").toString();
+        struct Rank {
+            int bucket = 4;
+            double primaryRemaining = -1;
+            double secondaryRemaining = -1;
+            double primaryResetSeconds = 1.0e12;
+            double secondaryResetSeconds = 1.0e12;
+            QString name;
+            QString key;
+        };
 
-        QString ka = DataManager::accountKey(oa);
-        QString kb = DataManager::accountKey(ob);
+        auto resetSeconds = [](const QJsonObject& limit) {
+            const double resetAt = limit.value("reset_at_dt").toDouble(0);
+            if (resetAt > 0) {
+                const double now = QDateTime::currentDateTimeUtc().toSecsSinceEpoch();
+                return qMax(0.0, resetAt - now);
+            }
 
-        QJsonObject ea = m_cache.value(ka).toObject();
-        QJsonObject eb = m_cache.value(kb).toObject();
+            const double resetAfter = limit.value("reset_after_seconds").toDouble(-1);
+            return resetAfter >= 0 ? resetAfter : 1.0e12;
+        };
 
-        if (ea.isEmpty() && eb.isEmpty()) return na < nb;
-        if (ea.isEmpty()) return false;
-        if (eb.isEmpty()) return true;
+        auto rankFor = [this, resetSeconds](const QJsonObject& account) {
+            Rank rank;
+            rank.name = account.value("name").toString();
 
-        QJsonObject ia = ea.value("info").toObject();
-        QJsonObject ib = eb.value("info").toObject();
+            const QString key = DataManager::accountKey(account);
+            rank.key = key;
+            if (!m_activeAccountKey.isEmpty() && key == m_activeAccountKey) {
+                rank.bucket = -1;
+                return rank;
+            }
 
-        bool allowedA = ia.value("rate_limit_allowed").toBool(false);
-        bool allowedB = ib.value("rate_limit_allowed").toBool(false);
+            const QJsonObject entry = m_cache.value(key).toObject();
+            if (entry.isEmpty() || !entry.value("ok").toBool(false))
+                return rank;
 
-        if (allowedA && !allowedB) return true;
-        if (!allowedA && allowedB) return false;
+            const QJsonObject info = entry.value("info").toObject();
+            const QJsonObject primary = info.value("primary").toObject();
+            const QJsonObject secondary = info.value("secondary").toObject();
+            rank.primaryRemaining = primary.value("remaining_pct").toDouble(-1);
+            rank.secondaryRemaining = secondary.value("remaining_pct").toDouble(-1);
+            rank.primaryResetSeconds = resetSeconds(primary);
+            rank.secondaryResetSeconds = resetSeconds(secondary);
 
-        double resetA = ia.value("primary").toObject().value("reset_after_seconds").toDouble(-1);
-        double resetB = ib.value("primary").toObject().value("reset_after_seconds").toDouble(-1);
+            const bool weeklyEmpty = rank.secondaryRemaining >= 0 && rank.secondaryRemaining <= 0.5;
+            const bool primaryEmpty = rank.primaryRemaining >= 0 && rank.primaryRemaining <= 0.5;
+            if (weeklyEmpty) {
+                rank.bucket = 3;
+            } else if (primaryEmpty) {
+                rank.bucket = 2;
+            } else if (rank.primaryRemaining >= 0 && rank.secondaryRemaining >= 0) {
+                rank.bucket = 0;
+            }
+            return rank;
+        };
 
-        if (resetA >= 0 && resetB >= 0) return resetA < resetB;
-        if (resetA >= 0) return true;
-        if (resetB >= 0) return false;
+        const Rank a = rankFor(oa);
+        const Rank b = rankFor(ob);
 
-        return na < nb;
+        if (a.bucket != b.bucket)
+            return a.bucket < b.bucket;
+
+        if (a.bucket == 2) {
+            if (a.primaryResetSeconds != b.primaryResetSeconds)
+                return a.primaryResetSeconds < b.primaryResetSeconds;
+        } else if (a.bucket == 3) {
+            if (a.secondaryResetSeconds != b.secondaryResetSeconds)
+                return a.secondaryResetSeconds < b.secondaryResetSeconds;
+        } else if (a.bucket == 0) {
+            const bool aPrimaryFull = a.primaryRemaining >= 99.5;
+            const bool bPrimaryFull = b.primaryRemaining >= 99.5;
+            if (aPrimaryFull != bPrimaryFull)
+                return aPrimaryFull;
+            if (aPrimaryFull && bPrimaryFull && a.secondaryRemaining != b.secondaryRemaining)
+                return a.secondaryRemaining > b.secondaryRemaining;
+            if (a.primaryRemaining != b.primaryRemaining)
+                return a.primaryRemaining > b.primaryRemaining;
+            if (a.secondaryRemaining != b.secondaryRemaining)
+                return a.secondaryRemaining > b.secondaryRemaining;
+        }
+
+        return a.name < b.name;
     };
 
     std::sort(accounts.begin(), accounts.end(), sortKey);
     m_accounts = QJsonArray();
     for (const QJsonObject& account : accounts)
         m_accounts.append(account);
+    m_dm->saveAccounts(m_accounts);
+}
+
+void MainWindow::keepActiveAccountFirst()
+{
+    if (m_activeAccountKey.isEmpty() || m_accounts.size() < 2)
+        return;
+
+    int activeIndex = -1;
+    for (int i = 0; i < m_accounts.size(); ++i) {
+        if (DataManager::accountKey(m_accounts.at(i).toObject()) == m_activeAccountKey) {
+            activeIndex = i;
+            break;
+        }
+    }
+    if (activeIndex <= 0)
+        return;
+
+    const QJsonValue activeAccount = m_accounts.at(activeIndex);
+    m_accounts.removeAt(activeIndex);
+    m_accounts.insert(0, activeAccount);
+    m_dm->saveAccounts(m_accounts);
 }
 
 void MainWindow::switchAccount(const QString& accountName)
 {
     QJsonObject account = accountByName(accountName);
     if (account.isEmpty()) return;
+    if (m_switchInProgress) {
+        QMessageBox::information(this, QString::fromUtf8("切换进行中"),
+            QString::fromUtf8("已有账号切换任务正在执行，请稍后再试。"));
+        return;
+    }
+
+    const bool remoteEnabled = m_remoteConfig.value("enabled").toBool(false);
+    m_switchInProgress = true;
+    m_switchAccountName = accountName;
+    m_waitingLocalRestart = true;
+    m_waitingCloudSwitch = false;
+    m_localSwitchOk = false;
+    m_cloudSwitchOk = !remoteEnabled;
+    m_localSwitchMessage.clear();
+    m_cloudSwitchMessage.clear();
 
     QString errorMsg;
-    if (m_dm->backupAndWriteAuthFile(account, errorMsg)) {
-        QMessageBox::information(this, QString::fromUtf8("成功"),
-            QString::fromUtf8("已成功切换至账号 %1。\n凭证已保存至 %2")
-                .arg(accountName, m_dm->codexAuthFilePath()));
-        restartLocalCodex();
-    } else {
-        QMessageBox::critical(this, QString::fromUtf8("错误"), errorMsg);
+    if (!m_dm->backupAndWriteAuthFile(account, errorMsg)) {
+        if (remoteEnabled) {
+            m_cloudSwitchOk = false;
+            m_cloudSwitchMessage = QString::fromUtf8("云端未执行: 本地替换失败。");
+        }
+        finishLocalRestart(false, QString::fromUtf8("本地替换失败: %1").arg(errorMsg));
+        return;
     }
+
+    m_activeAccountKey = DataManager::accountKey(account);
+    QJsonObject activeEntry = m_cache.value(m_activeAccountKey).toObject();
+    const double nowTs = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch() / 1000.0;
+    const bool disabled = activeEntry.value("auto_query_disabled").toBool(false) ||
+        activeEntry.value("http_status").toInt(-1) == 401 ||
+        activeEntry.value("message").toString().contains("HTTP 401");
+    if (!disabled)
+        activeEntry["next_auto_query_ts"] = nowTs + (m_activeQueryIntervalMinutes * 60.0) + queryJitterSeconds();
+    m_cache[m_activeAccountKey] = activeEntry;
+    m_dm->saveCache(m_cache);
+    saveState();
+    sortAccounts();
+    rebuildCards();
+    scheduleNextAutoQuery(disabled ? 30000 : m_activeQueryIntervalMinutes * 60 * 1000);
+
+    if (remoteEnabled) {
+        m_waitingCloudSwitch = true;
+        startCloudSwitch(accountName);
+    }
+    restartLocalCodex();
 }
 
-void MainWindow::cloudSwitchAccount(const QString& accountName)
+void MainWindow::startCloudSwitch(const QString& accountName)
 {
     QJsonObject account = accountByName(accountName);
-    if (account.isEmpty()) return;
+    if (account.isEmpty()) {
+        finishCloudSwitch(false, QString::fromUtf8("云端替换失败: 未找到账号。"));
+        return;
+    }
 
     QJsonObject rc = m_remoteConfig;
-    QString user = rc.value("user").toString("haoze");
+    QString user = rc.value("user").toString("root");
     QString host = rc.value("host").toString("127.0.0.1");
-    QString port = QString::number(rc.value("port").toInt(9002));
+    QString port = QString::number(rc.value("port").toInt(22));
 
     m_cloudAccountName = accountName;
     m_cloudStage = CheckAuth;
 
     QString tmpPath;
     QString errorMsg;
-    if (!m_dm->writeTempAuthFile(account, tmpPath, errorMsg)) {
-        QMessageBox::critical(this, QString::fromUtf8("远程替换失败"), errorMsg);
+    if (!m_dm->writeTempCurrentAuthFile(tmpPath, errorMsg)) {
+        finishCloudSwitch(false, QString::fromUtf8("云端替换失败: %1").arg(errorMsg));
         return;
     }
     m_cloudTmpPath = tmpPath;
+
+    QString tmpInstallationPath;
+    if (!m_dm->writeTempCurrentInstallationIdFile(tmpInstallationPath, errorMsg)) {
+        cleanupCloudTemp();
+        finishCloudSwitch(false, QString::fromUtf8("云端替换失败: %1").arg(errorMsg));
+        return;
+    }
+    m_cloudInstallationTmpPath = tmpInstallationPath;
 
     if (m_cloudProcess) {
         m_cloudProcess->kill();
@@ -800,6 +1253,11 @@ void MainWindow::cloudSwitchAccount(const QString& accountName)
     }
 
     m_cloudProcess = new QProcess(this);
+    connect(m_cloudProcess, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
+        finishCloudSwitch(false,
+            QString::fromUtf8("云端替换失败: 无法启动 ssh/scp 进程。\n%1")
+                .arg(m_cloudProcess ? m_cloudProcess->errorString() : QString()));
+    });
     connect(m_cloudProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
             this, &MainWindow::onRemoteAuthCheckFinished);
 
@@ -817,26 +1275,34 @@ void MainWindow::onRemoteAuthCheckFinished(int exitCode)
 {
     if (exitCode != 0) {
         const QString err = QString::fromUtf8(m_cloudProcess->readAllStandardError()).trimmed();
-        QMessageBox::critical(this, QString::fromUtf8("远程替换失败"),
-            QString::fromUtf8("远端不存在 ~/.codex/auth.json，已停止替换。\n"
+        cleanupCloudTemp();
+        finishCloudSwitch(false,
+            QString::fromUtf8("云端替换失败: 远端不存在 ~/.codex/auth.json，已停止替换。\n"
                               "程序不会自动创建 ~/.codex；请先确认远端 Codex 已初始化并存在 auth.json。\n%1")
                 .arg(err.left(500)));
-        cleanupCloudTemp();
         return;
     }
 
     m_cloudStage = Backup;
     QJsonObject rc = m_remoteConfig;
-    QString user = rc.value("user").toString("haoze");
+    QString user = rc.value("user").toString("root");
     QString host = rc.value("host").toString("127.0.0.1");
-    QString port = QString::number(rc.value("port").toInt(9002));
+    QString port = QString::number(rc.value("port").toInt(22));
 
     disconnect(m_cloudProcess, nullptr, this, nullptr);
+    connect(m_cloudProcess, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
+        finishCloudSwitch(false,
+            QString::fromUtf8("云端替换失败: 无法启动 ssh/scp 进程。\n%1")
+                .arg(m_cloudProcess ? m_cloudProcess->errorString() : QString()));
+    });
     connect(m_cloudProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
             this, &MainWindow::onRemoteBackupFinished);
 
     QString ts = QDateTime::currentDateTime().toString("yyyyMMddHHmmss");
-    QString backupCmd = QString("if [ -f ~/.codex/auth.json ]; then cp ~/.codex/auth.json ~/.codex/auth.json.bak_%1; fi").arg(ts);
+    QString backupCmd = QString(
+        "if [ -f ~/.codex/auth.json ]; then cp ~/.codex/auth.json ~/.codex/auth.json.bak_%1; fi; "
+        "if [ -f ~/.codex/installation_id ]; then cp ~/.codex/installation_id ~/.codex/installation_id.bak_%1; fi"
+    ).arg(ts);
 
     QStringList args;
     args << "-o" << "ConnectTimeout=10" << "-o" << "BatchMode=yes"
@@ -851,41 +1317,80 @@ void MainWindow::onRemoteAuthCheckFinished(int exitCode)
 void MainWindow::onRemoteBackupFinished(int exitCode)
 {
     if (exitCode != 0) {
-        QMessageBox::critical(this, QString::fromUtf8("远程替换失败"),
-            QString::fromUtf8("远端备份 auth.json 失败:\n%1")
-                .arg(QString(m_cloudProcess->readAllStandardError())));
+        const QString err = QString::fromUtf8(m_cloudProcess->readAllStandardError());
         cleanupCloudTemp();
+        finishCloudSwitch(false, QString::fromUtf8("云端替换失败: 远端备份 auth.json 失败:\n%1").arg(err));
         return;
     }
 
-    m_cloudStage = Upload;
+    m_cloudStage = UploadAuth;
     QJsonObject rc = m_remoteConfig;
-    QString user = rc.value("user").toString("haoze");
+    QString user = rc.value("user").toString("root");
     QString host = rc.value("host").toString("127.0.0.1");
-    QString port = QString::number(rc.value("port").toInt(9002));
+    QString port = QString::number(rc.value("port").toInt(22));
 
     disconnect(m_cloudProcess, nullptr, this, nullptr);
+    connect(m_cloudProcess, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
+        finishCloudSwitch(false,
+            QString::fromUtf8("云端替换失败: 无法启动 ssh/scp 进程。\n%1")
+                .arg(m_cloudProcess ? m_cloudProcess->errorString() : QString()));
+    });
     connect(m_cloudProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, &MainWindow::onScpUploadFinished);
+            this, &MainWindow::onScpAuthUploadFinished);
 
     QStringList args;
     args << "-o" << "ConnectTimeout=10"
+         << "-o" << "BatchMode=yes"
          << "-o" << "StrictHostKeyChecking=no"
+         << "-o" << "NumberOfPasswordPrompts=0"
          << "-P" << port
-         << m_cloudTmpPath << user + "@" + host + ":~/.codex/auth.json";
+         << m_cloudTmpPath << remoteCodexFileTarget(user, host, "auth.json");
 
     m_cloudProcess->start("scp", args);
 }
 
-void MainWindow::onScpUploadFinished(int exitCode)
+void MainWindow::onScpAuthUploadFinished(int exitCode)
+{
+    if (exitCode == 0) {
+        m_cloudStage = UploadInstallationId;
+        QJsonObject rc = m_remoteConfig;
+        QString user = rc.value("user").toString("root");
+        QString host = rc.value("host").toString("127.0.0.1");
+        QString port = QString::number(rc.value("port").toInt(22));
+
+        disconnect(m_cloudProcess, nullptr, this, nullptr);
+        connect(m_cloudProcess, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
+            finishCloudSwitch(false,
+                QString::fromUtf8("云端替换失败: 无法启动 ssh/scp 进程。\n%1")
+                    .arg(m_cloudProcess ? m_cloudProcess->errorString() : QString()));
+        });
+        connect(m_cloudProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+                this, &MainWindow::onScpInstallationIdUploadFinished);
+
+        QStringList args;
+        args << "-o" << "ConnectTimeout=10"
+             << "-o" << "BatchMode=yes"
+             << "-o" << "StrictHostKeyChecking=no"
+             << "-o" << "NumberOfPasswordPrompts=0"
+             << "-P" << port
+             << m_cloudInstallationTmpPath << remoteCodexFileTarget(user, host, "installation_id");
+
+        m_cloudProcess->start("scp", args);
+    } else {
+        const QString err = QString::fromUtf8(m_cloudProcess->readAllStandardError());
+        cleanupCloudTemp();
+        finishCloudSwitch(false, QString::fromUtf8("云端替换失败: 无法上传 auth.json 到远程:\n%1").arg(err));
+    }
+}
+
+void MainWindow::onScpInstallationIdUploadFinished(int exitCode)
 {
     if (exitCode == 0) {
         restartRemoteCodex();
     } else {
-        QMessageBox::critical(this, QString::fromUtf8("远程替换失败"),
-            QString::fromUtf8("无法上传 auth.json 到远程:\n%1")
-                .arg(QString(m_cloudProcess->readAllStandardError())));
+        const QString err = QString::fromUtf8(m_cloudProcess->readAllStandardError());
         cleanupCloudTemp();
+        finishCloudSwitch(false, QString::fromUtf8("云端替换失败: 无法上传 installation_id 到远程:\n%1").arg(err));
     }
 }
 
@@ -895,15 +1400,42 @@ void MainWindow::cleanupCloudTemp()
         QFile::remove(m_cloudTmpPath);
         m_cloudTmpPath.clear();
     }
+    if (!m_cloudInstallationTmpPath.isEmpty()) {
+        QFile::remove(m_cloudInstallationTmpPath);
+        m_cloudInstallationTmpPath.clear();
+    }
 }
 
 void MainWindow::restartLocalCodex()
 {
+#ifdef Q_OS_WIN
+    QProcess* proc = new QProcess(this);
+    connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this, [this, proc](int exitCode, QProcess::ExitStatus status) {
+        const QString err = QString::fromUtf8(proc->readAllStandardError()).trimmed();
+        proc->deleteLater();
+        if (status == QProcess::NormalExit && exitCode == 0) {
+            finishLocalRestart(true, QString::fromUtf8("本地替换成功，并已请求重启本地 Codex。"));
+        } else {
+            finishLocalRestart(false,
+                QString::fromUtf8("本地 auth.json 与 installation_id 已替换，但自动重启 Codex 失败。\n%1")
+                    .arg(err.left(500)));
+        }
+    });
+    connect(proc, &QProcess::errorOccurred, this, [this, proc](QProcess::ProcessError) {
+        proc->deleteLater();
+        finishLocalRestart(false,
+            QString::fromUtf8("本地 auth.json 与 installation_id 已替换，但无法启动 PowerShell 重启 Codex。"));
+    });
+    proc->start("powershell", QStringList()
+        << "-NoProfile" << "-ExecutionPolicy" << "Bypass"
+        << "-Command" << windowsRestartCodexScript());
+#else
     const QString codexProgram = findCodexExecutable();
     if (codexProgram.isEmpty()) {
-        QMessageBox::warning(this, QString::fromUtf8("Codex 重启失败"),
+        finishLocalRestart(false,
             QString::fromUtf8("本地 auth.json 已替换，但未找到本地 Codex 可执行文件。\n"
-                              "已尝试 codex.exe/codex.cmd/codex、WindowsApps 与 npm 常见路径。"));
+                              "已尝试 LocalAppData/OpenAI/Codex/bin、codex.exe/codex.cmd/codex 与 npm 常见路径。"));
         return;
     }
 
@@ -913,35 +1445,41 @@ void MainWindow::restartLocalCodex()
         const QString err = QString::fromUtf8(proc->readAllStandardError()).trimmed();
         proc->deleteLater();
         if (status == QProcess::NormalExit && exitCode == 0) {
-            QMessageBox::information(this, QString::fromUtf8("Codex 已重启"),
-                QString::fromUtf8("本地 auth.json 已替换，并已请求重启本地 Codex。"));
+            finishLocalRestart(true, QString::fromUtf8("本地替换成功，并已请求重启本地 Codex。"));
         } else {
-            QMessageBox::warning(this, QString::fromUtf8("Codex 重启失败"),
+            finishLocalRestart(false,
                 QString::fromUtf8("本地 auth.json 已替换，但自动重启 Codex 失败。\n程序: %1\n%2")
                     .arg(codexProgram, err.left(500)));
         }
     });
     connect(proc, &QProcess::errorOccurred, this, [this, proc, codexProgram](QProcess::ProcessError) {
         proc->deleteLater();
-        QMessageBox::warning(this, QString::fromUtf8("Codex 重启失败"),
+        finishLocalRestart(false,
             QString::fromUtf8("本地 auth.json 已替换，但无法启动 Codex。\n程序: %1").arg(codexProgram));
     });
     proc->start(codexProgram, QStringList() << "app-server" << "daemon" << "restart");
+#endif
 }
 
 void MainWindow::restartRemoteCodex()
 {
     m_cloudStage = Restart;
     QJsonObject rc = m_remoteConfig;
-    QString user = rc.value("user").toString("haoze");
+    QString user = rc.value("user").toString("root");
     QString host = rc.value("host").toString("127.0.0.1");
-    QString port = QString::number(rc.value("port").toInt(9002));
+    QString port = QString::number(rc.value("port").toInt(22));
 
     disconnect(m_cloudProcess, nullptr, this, nullptr);
+    connect(m_cloudProcess, &QProcess::errorOccurred, this, [this](QProcess::ProcessError) {
+        finishCloudSwitch(false,
+            QString::fromUtf8("云端替换失败: 无法启动 ssh/scp 进程。\n%1")
+                .arg(m_cloudProcess ? m_cloudProcess->errorString() : QString()));
+    });
     connect(m_cloudProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
             this, &MainWindow::onRemoteRestartFinished);
 
     const QString restartCmd =
+        "chmod 600 ~/.codex/auth.json ~/.codex/installation_id 2>/dev/null || true; "
         "codex_bin=\"$HOME/.codex/packages/standalone/current/codex\"; "
         "if [ ! -x \"$codex_bin\" ]; then codex_bin=codex; fi; "
         "\"$codex_bin\" app-server daemon restart || { "
@@ -984,14 +1522,63 @@ void MainWindow::restartRemoteCodex()
 void MainWindow::onRemoteRestartFinished(int exitCode)
 {
     if (exitCode == 0) {
-        QMessageBox::information(this, QString::fromUtf8("成功"),
-            QString::fromUtf8("已成功将账号 %1 的凭证推送至远程，并已请求重启远端 Codex。").arg(m_cloudAccountName));
+        finishCloudSwitch(true,
+            QString::fromUtf8("云端替换成功，并已请求重启远端 Codex。"));
     } else {
-        QMessageBox::warning(this, QString::fromUtf8("远端 Codex 重启失败"),
-            QString::fromUtf8("auth.json 已上传，但远端 Codex 重启失败:\n%1")
-                .arg(QString(m_cloudProcess->readAllStandardError()).left(500)));
+        finishCloudSwitch(false,
+            QString::fromUtf8("云端 auth.json 与 installation_id 已上传，但远端 Codex 重启失败:\n%1")
+                .arg(QString::fromUtf8(m_cloudProcess->readAllStandardError()).left(500)));
     }
+}
+
+void MainWindow::finishLocalRestart(bool ok, const QString& message)
+{
+    m_localSwitchOk = ok;
+    m_localSwitchMessage = message;
+    m_waitingLocalRestart = false;
+    maybeShowSwitchSummary();
+}
+
+void MainWindow::finishCloudSwitch(bool ok, const QString& message)
+{
     cleanupCloudTemp();
+    m_cloudSwitchOk = ok;
+    m_cloudSwitchMessage = message;
+    m_waitingCloudSwitch = false;
+    maybeShowSwitchSummary();
+}
+
+void MainWindow::maybeShowSwitchSummary()
+{
+    if (!m_switchInProgress || m_waitingLocalRestart || m_waitingCloudSwitch)
+        return;
+
+    const bool remoteEnabledForThisSwitch = !m_cloudSwitchMessage.isEmpty();
+    const bool allOk = m_localSwitchOk && m_cloudSwitchOk;
+
+    QStringList lines;
+    lines << QString::fromUtf8("账号: %1").arg(m_switchAccountName);
+    lines << QString();
+    lines << QString::fromUtf8("本地: %1").arg(m_localSwitchMessage);
+    if (remoteEnabledForThisSwitch)
+        lines << QString::fromUtf8("云端: %1").arg(m_cloudSwitchMessage);
+
+    QMessageBox::Icon icon = allOk ? QMessageBox::Information : QMessageBox::Warning;
+    QMessageBox box(icon,
+        allOk ? QString::fromUtf8("切换完成") : QString::fromUtf8("切换结果"),
+        lines.join("\n"),
+        QMessageBox::Ok,
+        this);
+    box.exec();
+
+    m_switchInProgress = false;
+    m_waitingLocalRestart = false;
+    m_waitingCloudSwitch = false;
+    m_localSwitchOk = false;
+    m_cloudSwitchOk = false;
+    m_switchAccountName.clear();
+    m_localSwitchMessage.clear();
+    m_cloudSwitchMessage.clear();
 }
 
 void MainWindow::deleteAccount(const QString& accountName)
@@ -1012,7 +1599,15 @@ void MainWindow::deleteAccount(const QString& accountName)
     m_accounts.removeAt(idx);
     QString key = DataManager::accountKey(account);
     m_cache.remove(key);
+    if (m_activeAccountKey == key) {
+        m_activeAccountKey.clear();
+        saveState();
+    }
 
+    QString dataError;
+    if (!m_dm->removeAccountData(account, dataError)) {
+        QMessageBox::warning(this, QString::fromUtf8("账号数据清理失败"), dataError);
+    }
     m_dm->saveCache(m_cache);
     m_dm->saveAccounts(m_accounts);
     sortAccounts();
@@ -1021,15 +1616,31 @@ void MainWindow::deleteAccount(const QString& accountName)
 
 void MainWindow::autoQueryCheck()
 {
-    double intervalSecs = m_queryIntervalMinutes * 60.0;
-    for (int i = 0; i < m_accounts.size(); ++i) {
-        QJsonObject acc = m_accounts[i].toObject();
-        QString key = DataManager::accountKey(acc);
-        if (m_queryingKeys.contains(key)) continue;
+    refreshCardTimes();
 
-        double age = cacheAgeSeconds(acc);
-        if (age < 0 || age >= intervalSecs) {
-            checkQuota(acc.value("name").toString());
+    if (m_accounts.isEmpty() || !m_queryingKeys.isEmpty()) {
+        scheduleNextAutoQuery(30000);
+        return;
+    }
+
+    const qint64 nowMs = QDateTime::currentDateTimeUtc().toMSecsSinceEpoch();
+    int dueIndex = -1;
+    qint64 dueAt = -1;
+    for (int i = 0; i < m_accounts.size(); ++i) {
+        const qint64 nextAt = nextAutoQueryAtMs(m_accounts.at(i).toObject());
+        if (nextAt < 0 || nextAt > nowMs)
+            continue;
+        if (dueIndex < 0 || nextAt < dueAt) {
+            dueIndex = i;
+            dueAt = nextAt;
         }
     }
+
+    if (dueIndex >= 0) {
+        checkQuota(m_accounts.at(dueIndex).toObject().value("name").toString());
+        scheduleNextAutoQuery(30000);
+        return;
+    }
+
+    scheduleNextAutoQuery();
 }

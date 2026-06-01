@@ -12,7 +12,9 @@
 #include <QTimer>
 #include <QVBoxLayout>
 
-SettingsDialog::SettingsDialog(int intervalMinutes, const QJsonObject& remoteConfig, QWidget* parent)
+SettingsDialog::SettingsDialog(int intervalMinutes, int activeIntervalMinutes,
+                               int quotaAlertThreshold,
+                               const QJsonObject& remoteConfig, QWidget* parent)
     : QDialog(parent)
 {
     setWindowTitle("设置");
@@ -33,15 +35,27 @@ SettingsDialog::SettingsDialog(int intervalMinutes, const QJsonObject& remoteCon
     m_interval->setSuffix(" 分钟");
     form->addRow("自动查询间隔", m_interval);
 
+    m_activeInterval = new QSpinBox();
+    m_activeInterval->setRange(1, 1440);
+    m_activeInterval->setValue(qMax(1, activeIntervalMinutes));
+    m_activeInterval->setSuffix(" 分钟");
+    form->addRow("当前账号查询间隔", m_activeInterval);
+
+    m_quotaAlertThreshold = new QSpinBox();
+    m_quotaAlertThreshold->setRange(0, 100);
+    m_quotaAlertThreshold->setValue(qBound(0, quotaAlertThreshold, 100));
+    m_quotaAlertThreshold->setSuffix(" %");
+    form->addRow("配额提醒阈值", m_quotaAlertThreshold);
+
     m_enableRemote = new QCheckBox("启用云端替换");
     m_enableRemote->setChecked(remoteConfig.value("enabled").toBool(false));
     form->addRow("", m_enableRemote);
 
-    m_user = new QLineEdit(remoteConfig.value("user").toString("haoze"));
+    m_user = new QLineEdit(remoteConfig.value("user").toString("root"));
     m_host = new QLineEdit(remoteConfig.value("host").toString("127.0.0.1"));
     m_port = new QSpinBox();
     m_port->setRange(1, 65535);
-    m_port->setValue(remoteConfig.value("port").toInt(9002));
+    m_port->setValue(remoteConfig.value("port").toInt(22));
     form->addRow("SSH 用户", m_user);
     form->addRow("SSH 地址", m_host);
     form->addRow("SSH 端口", m_port);
@@ -95,6 +109,16 @@ SettingsDialog::SettingsDialog(int intervalMinutes, const QJsonObject& remoteCon
 int SettingsDialog::intervalMinutes() const
 {
     return m_interval->value();
+}
+
+int SettingsDialog::activeIntervalMinutes() const
+{
+    return m_activeInterval->value();
+}
+
+int SettingsDialog::quotaAlertThreshold() const
+{
+    return m_quotaAlertThreshold->value();
 }
 
 QJsonObject SettingsDialog::remoteConfig() const
